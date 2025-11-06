@@ -33,14 +33,14 @@ while True:
                     thumb_coord = np.array((hand.landmark[THUMB_POINT_INDEX].x, hand.landmark[THUMB_POINT_INDEX].y))
                     index_coord = np.array((hand.landmark[INDEX_FINGER_POINT_INDEX].x, hand.landmark[INDEX_FINGER_POINT_INDEX].y))
                     
-                    #Euclidean distance from 
+                    #Euclidean distance from index to thumb tip
                     distance = np.linalg.norm(thumb_coord - index_coord)
                    
                     #Distance calibration
-                    min_diff = np.minimum(distance + 50, min_diff)
+                    min_diff = np.minimum(distance, min_diff)
                     max_diff = np.maximum(distance, max_diff)
                     #Interpolated Volume, mapped from -65DB to 0
-                    normalisedVol = np.interp(distance/max_diff, [0,1], [-65.0, 0.0])
+                    normalisedVol = np.interp(distance, [min_diff, max_diff], [-65.0, 0.0])
                     volume.SetMasterVolumeLevel(normalisedVol, None)
                     print(normalisedVol) 
                     
