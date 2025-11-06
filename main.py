@@ -19,9 +19,9 @@ hands = handSolution.Hands()
 
 while True:
         success, img = videoCap.read()
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if success:
-            recHands = hands.process(img)
+            recHands = hands.process(img_rgb)
             if recHands.multi_hand_landmarks:
                 for hand in recHands.multi_hand_landmarks:
                     
