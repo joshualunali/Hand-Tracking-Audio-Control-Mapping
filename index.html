@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Volume Control</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4;
+    --text: #1c1c1a;
+    --muted: #63635e;
+    --track: #dcdcd6;
+    --accent: #1f6f5c;
+    --on-accent: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615;
+      --text: #ecece8;
+      --muted: #a2a29b;
+      --track: #363633;
+      --accent: #5cc4a9;
+      --on-accent: #10231e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 32px 16px;
+    display: grid;
+    gap: 16px;
+  }
+  h1 { margin: 0; font-size: 1.6rem; line-height: 1.2; }
+  p { margin: 0; }
+  .hint, #status { color: var(--muted); }
+  .stage {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #000;
+  }
+  /* Mirrored so moving your hand right moves it right on screen. */
+  video, canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    transform: scaleX(-1);
+  }
+  .volume {
+    display: grid;
+    grid-template-columns: auto 1fr 3.5ch;
+    align-items: center;
+    gap: 12px;
+  }
+  .track {
+    height: 10px;
+    border-radius: 5px;
+    background: var(--track);
+    overflow: hidden;
+  }
+  #volume-bar {
+    height: 100%;
+    width: 50%;
+    background: var(--accent);
+  }
+  #volume-value { text-align: right; font-variant-numeric: tabular-nums; }
+  button {
+    justify-self: start;
+    min-height: 44px;
+    padding: 0 24px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--on-accent);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: progress; }
+  button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Hand Volume Control</h1>
+  <p class="hint">Press Start, then pinch your thumb and index finger together and spread them as
+    wide as you can. That sets your range, and the distance between them then controls this
+    page's tone. Video stays on your device.</p>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="volume">
+    <span id="volume-label">Volume</span>
+    <div class="track" role="progressbar" aria-labelledby="volume-label"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" id="volume-track">
+      <div id="volume-bar"></div>
+    </div>
+    <span id="volume-value">50%</span>
+  </div>
+
+  <button id="toggle" type="button">Start</button>
+  <p id="status" role="status">Needs camera access. Your speakers will play a soft tone.</p>
+</main>
+
+<script type="module">
+  import { FilesetResolver, HandLandmarker } from
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/vision_bundle.mjs";
+
+  const WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm";
+  const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+  const THUMB_POINT_INDEX = 4;
+  const INDEX_FINGER_POINT_INDEX = 8;
+  const MIN_VOLUME_DB = -65;
+  const TONE_FREQUENCIES_HZ = [110, 164.81, 220, 277.18];
+
+  const video = document.getElementById("video");
+  const overlay = document.getElementById("overlay");
+  const drawing = overlay.getContext("2d");
+  const stage = document.getElementById("stage");
+  const toggle = document.getElementById("toggle");
+  const statusText = document.getElementById("status");
+  const volumeBar = document.getElementById("volume-bar");
+  const volumeTrack = document.getElementById("volume-track");
+  const volumeValue = document.getElementById("volume-value");
+
+  let landmarker = null;
+  let stream = null;
+  let audio = null;
+  let frameRequest = 0;
+  let lastVideoTime = -1;
+  let currentVolume = 0.5;
+
+  // Set to unrealistic values so that calibration begins immediately.
+  let minDiff = 1;
+  let maxDiff = 0;
+
+  function createAudio() {
+    const context = new AudioContext();
+    const master = context.createGain();
+    master.gain.value = dbToGain(volumeToDb(currentVolume));
+    master.connect(context.destination);
+
+    const voiceLevel = context.createGain();
+    voiceLevel.gain.value = 0.15;
+    voiceLevel.connect(master);
+
+    for (const frequency of TONE_FREQUENCIES_HZ) {
+      const oscillator = context.createOscillator();
+      oscillator.frequency.value = frequency;
+      oscillator.connect(voiceLevel);
+      oscillator.start();
+    }
+    return { context, master };
+  }
+
+  // Volume moves linearly in dB, matching the desktop version's system volume mapping.
+  function volumeToDb(volume) {
+    return MIN_VOLUME_DB * (1 - volume);
+  }
+
+  function dbToGain(db) {
+    return 10 ** (db / 20);
+  }
+
+  function setVolume(volume) {
+    currentVolume = volume;
+    audio.master.gain.setTargetAtTime(dbToGain(volumeToDb(volume)), audio.context.currentTime, 0.03);
+    const percent = Math.round(volume * 100);
+    volumeBar.style.width = `${percent}%`;
+    volumeValue.textContent = `${percent}%`;
+    volumeTrack.setAttribute("aria-valuenow", percent);
+  }
+
+  async function createLandmarker() {
+    const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+    const options = delegate => ({
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+    try {
+      return await HandLandmarker.createFromOptions(fileset, options("GPU"));
+    } catch {
+      return await HandLandmarker.createFromOptions(fileset, options("CPU"));
+    }
+  }
+
+  function drawHand(hand) {
+    drawing.fillStyle = "#ffffff";
+    for (const point of hand) {
+      drawing.beginPath();
+      drawing.arc(point.x * overlay.width, point.y * overlay.height, 10, 0, 2 * Math.PI);
+      drawing.fill();
+    }
+  }
+
+  function updateVolumeFromHand(hand) {
+    const thumb = hand[THUMB_POINT_INDEX];
+    const index = hand[INDEX_FINGER_POINT_INDEX];
+
+    // Euclidean distance from index to thumb tip
+    const distance = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+
+    // Distance calibration
+    minDiff = Math.min(distance, minDiff);
+    maxDiff = Math.max(distance, maxDiff);
+
+    if (maxDiff > minDiff) {
+      setVolume((distance - minDiff) / (maxDiff - minDiff));
+    }
+  }
+
+  function trackFrame() {
+    frameRequest = requestAnimationFrame(trackFrame);
+    if (video.currentTime === lastVideoTime) return;
+    lastVideoTime = video.currentTime;
+
+    const { landmarks } = landmarker.detectForVideo(video, performance.now());
+    drawing.clearRect(0, 0, overlay.width, overlay.height);
+    for (const hand of landmarks) {
+      drawHand(hand);
+      updateVolumeFromHand(hand);
+    }
+  }
+
+  async function start() {
+    toggle.disabled = true;
+    // The browser only allows audio to begin during the click itself, so this comes first.
+    audio = createAudio();
+
+    try {
+      statusText.textContent = "Waiting for camera access…";
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+      stage.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+
+      statusText.textContent = "Loading hand model…";
+      landmarker ??= await createLandmarker();
+
+      trackFrame();
+      toggle.textContent = "Stop";
+      statusText.textContent = "Tracking. Pinch and spread your fingers to set your range.";
+    } catch (error) {
+      stop();
+      statusText.textContent = describeError(error);
+    }
+    toggle.disabled = false;
+  }
+
+  function stop() {
+    cancelAnimationFrame(frameRequest);
+    stream?.getTracks().forEach(track => track.stop());
+    stream = null;
+    video.srcObject = null;
+    lastVideoTime = -1;
+    audio?.context.close();
+    audio = null;
+    drawing.clearRect(0, 0, overlay.width, overlay.height);
+    toggle.textContent = "Start";
+    statusText.textContent = "Stopped.";
+  }
+
+  function describeError(error) {
+    if (error.name === "NotAllowedError") {
+      return "Camera access was blocked. Allow it in your browser's site settings, then press Start.";
+    }
+    if (error.name === "NotFoundError") {
+      return "No camera was found. Connect one, then press Start.";
+    }
+    return `Something went wrong: ${error.message}`;
+  }
+
+  toggle.addEventListener("click", () => (stream ? stop() : start()));
+</script>
+</body>
+</html>
