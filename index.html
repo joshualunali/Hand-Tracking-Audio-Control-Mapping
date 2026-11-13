@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hand Volume Control</title>
+<title>Hand Volume and Pitch Control</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -56,7 +56,7 @@
     height: 100%;
     transform: scaleX(-1);
   }
-  .volume {
+  .meters {
     display: grid;
     grid-template-columns: auto 1fr 3.5ch;
     align-items: center;
@@ -68,12 +68,12 @@
     background: var(--track);
     overflow: hidden;
   }
-  #volume-bar {
+  .fill {
     height: 100%;
     width: 50%;
     background: var(--accent);
   }
-  #volume-value { text-align: right; font-variant-numeric: tabular-nums; }
+  .value { text-align: right; font-variant-numeric: tabular-nums; }
   button {
     justify-self: start;
     min-height: 44px;
@@ -92,23 +92,32 @@
 </head>
 <body>
 <main>
-  <h1>Hand Volume Control</h1>
-  <p class="hint">Press Start, then pinch your thumb and index finger together and spread them as
-    wide as you can. That sets your range, and the distance between them then controls this
-    page's tone. Video stays on your device.</p>
+  <h1>Hand Volume and Pitch Control</h1>
+  <p class="hint">Press Start, then on each hand pinch your thumb and index finger together and
+    spread them as wide as you can. That sets the hand's range. After that, the gap on your right
+    hand controls the tone's volume and the gap on your left hand controls its pitch. Video stays
+    on your device.</p>
 
   <div class="stage" id="stage">
     <video id="video" playsinline muted></video>
     <canvas id="overlay"></canvas>
   </div>
 
-  <div class="volume">
+  <div class="meters">
     <span id="volume-label">Volume</span>
     <div class="track" role="progressbar" aria-labelledby="volume-label"
          aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" id="volume-track">
-      <div id="volume-bar"></div>
+      <div class="fill" id="volume-bar"></div>
     </div>
-    <span id="volume-value">50%</span>
+    <span class="value" id="volume-value">50%</span>
+
+    <span id="pitch-label">Pitch</span>
+    <div class="track" role="progressbar" aria-labelledby="pitch-label"
+         aria-valuemin="-12" aria-valuemax="12" aria-valuenow="0"
+         aria-valuetext="0 semitones" id="pitch-track">
+      <div class="fill" id="pitch-bar"></div>
+    </div>
+    <span class="value" id="pitch-value">0</span>
   </div>
 
   <button id="toggle" type="button">Start</button>
@@ -125,6 +134,7 @@
   const THUMB_POINT_INDEX = 4;
   const INDEX_FINGER_POINT_INDEX = 8;
   const MIN_VOLUME_DB = -65;
+  const PITCH_RANGE_SEMITONES = 12;
   const TONE_FREQUENCIES_HZ = [110, 164.81, 220, 277.18];
 
   const video = document.getElementById("video");
@@ -136,6 +146,9 @@
   const volumeBar = document.getElementById("volume-bar");
   const volumeTrack = document.getElementById("volume-track");
   const volumeValue = document.getElementById("volume-value");
+  const pitchBar = document.getElementById("pitch-bar");
+  const pitchTrack = document.getElementById("pitch-track");
+  const pitchValue = document.getElementById("pitch-value");
 
   let landmarker = null;
   let stream = null;
@@ -143,10 +156,14 @@
   let frameRequest = 0;
   let lastVideoTime = -1;
   let currentVolume = 0.5;
+  let currentPitch = 0.5;
 
-  // Set to unrealistic values so that calibration begins immediately.
-  let minDiff = 1;
-  let maxDiff = 0;
+  // Each hand drives one control and keeps its own pinch range.
+  // The range starts at unrealistic values so that calibration begins immediately.
+  const controls = {
+    right: { apply: setVolume, minDiff: 1, maxDiff: 0 },
+    left: { apply: setPitch, minDiff: 1, maxDiff: 0 },
+  };
 
   function createAudio() {
     const context = new AudioContext();
@@ -158,13 +175,15 @@
     voiceLevel.gain.value = 0.15;
     voiceLevel.connect(master);
 
-    for (const frequency of TONE_FREQUENCIES_HZ) {
+    const oscillators = TONE_FREQUENCIES_HZ.map(frequency => {
       const oscillator = context.createOscillator();
       oscillator.frequency.value = frequency;
+      oscillator.detune.value = pitchToSemitones(currentPitch) * 100;
       oscillator.connect(voiceLevel);
       oscillator.start();
-    }
-    return { context, master };
+      return oscillator;
+    });
+    return { context, master, oscillators };
   }
 
   // Volume moves linearly in dB, matching the desktop version's system volume mapping.
@@ -183,6 +202,26 @@
     volumeBar.style.width = `${percent}%`;
     volumeValue.textContent = `${percent}%`;
     volumeTrack.setAttribute("aria-valuenow", percent);
+  }
+
+  // The middle of the range is the original chord. The ends are one octave down and up.
+  function pitchToSemitones(pitch) {
+    return PITCH_RANGE_SEMITONES * (2 * pitch - 1);
+  }
+
+  function setPitch(pitch) {
+    currentPitch = pitch;
+    // Detune shifts every note of the chord by the same amount, so it stays in tune with itself.
+    const cents = pitchToSemitones(pitch) * 100;
+    for (const oscillator of audio.oscillators) {
+      oscillator.detune.setTargetAtTime(cents, audio.context.currentTime, 0.03);
+    }
+    const semitones = Math.round(pitchToSemitones(pitch));
+    const sign = semitones > 0 ? "+" : semitones < 0 ? "−" : "";
+    pitchBar.style.width = `${Math.round(pitch * 100)}%`;
+    pitchValue.textContent = `${sign}${Math.abs(semitones)}`;
+    pitchTrack.setAttribute("aria-valuenow", semitones);
+    pitchTrack.setAttribute("aria-valuetext", `${semitones} semitones`);
   }
 
   async function createLandmarker() {
@@ -208,7 +247,14 @@
     }
   }
 
-  function updateVolumeFromHand(hand) {
+  // MediaPipe's label matches the user's own hand here, even though only the on-screen video is
+  // mirrored. Older MediaPipe docs say to swap the labels for unmirrored frames, which proved
+  // wrong in testing.
+  function userSide(categories) {
+    return categories[0].categoryName === "Left" ? "left" : "right";
+  }
+
+  function updateControlFromHand(hand, control) {
     const thumb = hand[THUMB_POINT_INDEX];
     const index = hand[INDEX_FINGER_POINT_INDEX];
 
@@ -216,11 +262,11 @@
     const distance = Math.hypot(thumb.x - index.x, thumb.y - index.y);
 
     // Distance calibration
-    minDiff = Math.min(distance, minDiff);
-    maxDiff = Math.max(distance, maxDiff);
+    control.minDiff = Math.min(distance, control.minDiff);
+    control.maxDiff = Math.max(distance, control.maxDiff);
 
-    if (maxDiff > minDiff) {
-      setVolume((distance - minDiff) / (maxDiff - minDiff));
+    if (control.maxDiff > control.minDiff) {
+      control.apply((distance - control.minDiff) / (control.maxDiff - control.minDiff));
     }
   }
 
@@ -229,12 +275,12 @@
     if (video.currentTime === lastVideoTime) return;
     lastVideoTime = video.currentTime;
 
-    const { landmarks } = landmarker.detectForVideo(video, performance.now());
+    const { landmarks, handedness } = landmarker.detectForVideo(video, performance.now());
     drawing.clearRect(0, 0, overlay.width, overlay.height);
-    for (const hand of landmarks) {
+    landmarks.forEach((hand, i) => {
       drawHand(hand);
-      updateVolumeFromHand(hand);
-    }
+      updateControlFromHand(hand, controls[userSide(handedness[i])]);
+    });
   }
 
   async function start() {
@@ -259,7 +305,8 @@
 
       trackFrame();
       toggle.textContent = "Stop";
-      statusText.textContent = "Tracking. Pinch and spread your fingers to set your range.";
+      statusText.textContent =
+        "Tracking. Pinch and spread the fingers on each hand to set its range.";
     } catch (error) {
       stop();
       statusText.textContent = describeError(error);
